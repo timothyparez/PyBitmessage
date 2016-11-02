@@ -63,7 +63,8 @@ _generalerrors = ("success",
     "not connected",
     "not available",
     "bad proxy type",
-    "bad input")
+    "bad input",
+    "timed out")
 
 _socks5errors = ("succeeded",
     "general SOCKS server failure",
@@ -129,7 +130,10 @@ class socksocket(socket.socket):
         Receive EXACTLY the number of bytes requested from the socket.
         Blocks until the required number of bytes have been received.
         """
-        data = self.recv(count)
+        try:
+            data = self.recv(count)
+        except socket.timeout:
+            raise GeneralProxyError((6, "timed out"))
         while len(data) < count:
             d = self.recv(count-len(data))
             if not d: raise GeneralProxyError((0, "connection closed unexpectedly"))
@@ -155,7 +159,7 @@ class socksocket(socket.socket):
         """
         self.__proxy = (proxytype, addr, port, rdns, username, password)
 
-    def __negotiatesocks5(self, destaddr, destport):
+    def __negotiatesocks5(self):
         """__negotiatesocks5(self,destaddr,destport)
         Negotiates a connection through a SOCKS5 server.
         """
@@ -200,6 +204,8 @@ class socksocket(socket.socket):
                 raise Socks5AuthError((2, _socks5autherrors[2]))
             else:
                 raise GeneralProxyError((1, _generalerrors[1]))
+                
+    def __connectsocks5(self, destaddr, destport):
         # Now we can request the actual connection
         req = struct.pack('BBB', 0x05, 0x01, 0x00)
         # If the given destination address is an IP address, we'll
@@ -247,6 +253,37 @@ class socksocket(socket.socket):
         else:
             self.__proxypeername = (destaddr, destport)
 
+    def __resolvesocks5(self, host):
+        # Now we can request the actual connection
+        req = struct.pack('BBB', 0x05, 0xF0, 0x00)
+        req += chr(0x03).encode() + chr(len(host)).encode() + host
+        req = req + struct.pack(">H", 8444)
+        self.sendall(req)
+        # Get the response
+        ip = ""
+        resp = self.__recvall(4)
+        if resp[0:1] != chr(0x05).encode():
+            self.close()
+            raise GeneralProxyError((1, _generalerrors[1]))
+        elif resp[1:2] != chr(0x00).encode():
+            # Connection failed
+            self.close()
+            if ord(resp[1:2])<=8:
+                raise Socks5Error((ord(resp[1:2]), _socks5errors[ord(resp[1:2])]))
+            else:
+                raise Socks5Error((9, _socks5errors[9]))
+        # Get the bound address/port
+        elif resp[3:4] == chr(0x01).encode():
+            ip = socket.inet_ntoa(self.__recvall(4))
+        elif resp[3:4] == chr(0x03).encode():
+            resp = resp + self.recv(1)
+            ip = self.__recvall(ord(resp[4:5]))
+        else:
+            self.close()
+            raise GeneralProxyError((1,_generalerrors[1]))
+        boundport = struct.unpack(">H", self.__recvall(2))[0]
+        return ip
+    
     def getproxysockname(self):
         """getsockname() -> address info
         Returns the bound IP address and port number at the proxy.
@@ -265,6 +302,9 @@ class socksocket(socket.socket):
         machine (note: getproxypeername returns the proxy)
         """
         return self.__proxypeername
+
+    def getproxytype(self):
+        return self.__proxy[0]
 
     def __negotiatesocks4(self,destaddr,destport):
         """__negotiatesocks4(self,destaddr,destport)
@@ -360,8 +400,16 @@ class socksocket(socket.socket):
                 portnum = self.__proxy[2]
             else:
                 portnum = 1080
-            _orgsocket.connect(self, (self.__proxy[1], portnum))
-            self.__negotiatesocks5(destpair[0], destpair[1])
+            try:
+                _orgsocket.connect(self, (self.__proxy[1], portnum))
+            except socket.error as e:
+                if e[0] == 101:
+                    raise Socks5Error((3, _socks5errors[3]))
+                if e[0] == 111:
+                    raise Socks5Error((5, _socks5errors[5]))
+                raise
+            self.__negotiatesocks5()
+            self.__connectsocks5(destpair[0], destpair[1])
         elif self.__proxy[0] == PROXY_TYPE_SOCKS4:
             if self.__proxy[2] != None:
                 portnum = self.__proxy[2]
@@ -380,3 +428,15 @@ class socksocket(socket.socket):
             _orgsocket.connect(self, (destpair[0], destpair[1]))
         else:
             raise GeneralProxyError((4, _generalerrors[4]))
+
+    def resolve(self, host):
+        if self.__proxy[0] == PROXY_TYPE_SOCKS5:
+            if self.__proxy[2] != None:
+                portnum = self.__proxy[2]
+            else:
+                portnum = 1080
+            _orgsocket.connect(self, (self.__proxy[1], portnum))
+            self.__negotiatesocks5()
+            return self.__resolvesocks5(host)
+        else:
+            return None

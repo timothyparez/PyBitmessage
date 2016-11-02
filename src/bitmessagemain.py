@@ -1,6 +1,6 @@
-#!/usr/bin/env python2.7
-# Copyright (c) 2012 Jonathan Warren
-# Copyright (c) 2012 The Bitmessage developers
+#!/usr/bin/python2.7
+# Copyright (c) 2012-2016 Jonathan Warren
+# Copyright (c) 2012-2016 The Bitmessage developers
 # Distributed under the MIT/X11 software license. See the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -23,8 +23,7 @@ import sys
 from subprocess import call
 import time
 
-from SimpleXMLRPCServer import SimpleXMLRPCServer
-from api import MySimpleXMLRPCRequestHandler
+from api import MySimpleXMLRPCRequestHandler, StoppableXMLRPCServer
 from helper_startup import isOurOperatingSystemLimitedToHavingVeryFewHalfOpenConnections
 
 import shared
@@ -39,27 +38,30 @@ from class_outgoingSynSender import outgoingSynSender
 from class_singleListener import singleListener
 from class_singleWorker import singleWorker
 from class_addressGenerator import addressGenerator
+from class_smtpDeliver import smtpDeliver
+from class_smtpServer import smtpServer
 from debug import logger
 
 # Helper Functions
 import helper_bootstrap
 import helper_generic
-    
+from helper_threading import *
 
 def connectToStream(streamNumber):
     shared.streamsInWhichIAmParticipating[streamNumber] = 'no data'
     selfInitiatedConnections[streamNumber] = {}
-    shared.inventorySets[streamNumber] = set()
-    queryData = sqlQuery('''SELECT hash FROM inventory WHERE streamnumber=?''', streamNumber)
-    for row in queryData:
-        shared.inventorySets[streamNumber].add(row[0])
 
-    
     if isOurOperatingSystemLimitedToHavingVeryFewHalfOpenConnections():
         # Some XP and Vista systems can only have 10 outgoing connections at a time.
         maximumNumberOfHalfOpenConnections = 9
     else:
         maximumNumberOfHalfOpenConnections = 64
+    try:
+        # don't overload Tor
+        if shared.config.get('bitmessagesettings', 'socksproxytype') != 'none':
+            maximumNumberOfHalfOpenConnections = 4
+    except:
+        pass
     for i in range(maximumNumberOfHalfOpenConnections):
         a = outgoingSynSender()
         a.setup(streamNumber, selfInitiatedConnections)
@@ -117,13 +119,24 @@ def _fixWinsock():
         socket.IPV6_V6ONLY = 27
 
 # This thread, of which there is only one, runs the API.
-class singleAPI(threading.Thread):
-
+class singleAPI(threading.Thread, StoppableThread):
     def __init__(self):
-        threading.Thread.__init__(self)
+        threading.Thread.__init__(self, name="singleAPI")
+        self.initStop()
+        
+    def stopThread(self):
+        super(singleAPI, self).stopThread()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect((shared.config.get('bitmessagesettings', 'apiinterface'), shared.config.getint(
+                'bitmessagesettings', 'apiport')))
+            s.shutdown(socket.SHUT_RDWR)
+            s.close()
+        except:
+            pass
 
     def run(self):
-        se = SimpleXMLRPCServer((shared.config.get('bitmessagesettings', 'apiinterface'), shared.config.getint(
+        se = StoppableXMLRPCServer((shared.config.get('bitmessagesettings', 'apiinterface'), shared.config.getint(
             'bitmessagesettings', 'apiport')), MySimpleXMLRPCRequestHandler, True, True)
         se.register_introspection_functions()
         se.serve_forever()
@@ -142,16 +155,21 @@ class Main:
         _fixWinsock()
 
         shared.daemon = daemon
-        # is the application already running?  If yes then exit.
-        thisapp = singleton.singleinstance()
 
         # get curses flag
-        curses = False
+        shared.curses = False
         if '-c' in sys.argv:
-            curses = True
+            shared.curses = True
 
-        signal.signal(signal.SIGINT, helper_generic.signal_handler)
-        # signal.signal(signal.SIGINT, signal.SIG_DFL)
+        # is the application already running?  If yes then exit.
+        shared.thisapp = singleton.singleinstance("", daemon)
+
+        if daemon:
+            with shared.printLock:
+                print('Running as a daemon. Send TERM signal to end.')
+            self.daemonize()
+
+        self.setSignalHandler()
 
         helper_bootstrap.knownNodes()
         # Start the address generation thread
@@ -168,6 +186,16 @@ class Main:
         sqlLookup = sqlThread()
         sqlLookup.daemon = False  # DON'T close the main program even if there are threads left. The closeEvent should command this thread to exit gracefully.
         sqlLookup.start()
+
+        # SMTP delivery thread
+        if daemon and shared.safeConfigGet("bitmessagesettings", "smtpdeliver", '') != '':
+            smtpDeliveryThread = smtpDeliver()
+            smtpDeliveryThread.start()
+
+        # SMTP daemon thread
+        if daemon and shared.safeConfigGetBoolean("bitmessagesettings", "smtpd"):
+            smtpServerThread = smtpServer()
+            smtpServerThread.start()
 
         # Start the thread that calculates POWs
         objectProcessorThread = objectProcessor()
@@ -203,9 +231,14 @@ class Main:
         singleListenerThread.setup(selfInitiatedConnections)
         singleListenerThread.daemon = True  # close the main program even if there are threads left
         singleListenerThread.start()
+        
+        if shared.safeConfigGetBoolean('bitmessagesettings','upnp'):
+            import upnp
+            upnpThread = upnp.uPnPThread()
+            upnpThread.start()
 
         if daemon == False and shared.safeConfigGetBoolean('bitmessagesettings', 'daemon') == False:
-            if curses == False:
+            if shared.curses == False:
                 if not depends.check_pyqt():
                     print('PyBitmessage requires PyQt unless you want to run it as a daemon and interact with it using the API. You can download PyQt from http://www.riverbankcomputing.com/software/pyqt/download   or by searching Google for \'PyQt Download\'. If you want to run in daemon mode, see https://bitmessage.org/wiki/Daemon')
                     print('You can also run PyBitmessage with the new curses interface by providing \'-c\' as a commandline argument.')
@@ -214,21 +247,40 @@ class Main:
                 import bitmessageqt
                 bitmessageqt.run()
             else:
-                if depends.check_curses():
+                if True:
+#                if depends.check_curses():
                     print('Running with curses')
                     import bitmessagecurses
                     bitmessagecurses.runwrapper()
         else:
             shared.config.remove_option('bitmessagesettings', 'dontconnect')
 
-            if daemon:
-                with shared.printLock:
-                    print('Running as a daemon. The main program should exit this thread.')
-            else:
-                with shared.printLock:
-                    print('Running as a daemon. You can use Ctrl+C to exit.')
-                while True:
-                    time.sleep(20)
+            while True:
+                time.sleep(20)
+
+    def daemonize(self):
+        if os.fork():
+            exit(0)
+        shared.thisapp.lock() # relock
+        os.umask(0)
+        os.setsid()
+        if os.fork():
+            exit(0)
+        shared.thisapp.lock() # relock
+        shared.thisapp.lockPid = None # indicate we're the final child
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = file('/dev/null', 'r')
+        so = file('/dev/null', 'a+')
+        se = file('/dev/null', 'a+', 0)
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+
+    def setSignalHandler(self):
+        signal.signal(signal.SIGINT, helper_generic.signal_handler)
+        signal.signal(signal.SIGTERM, helper_generic.signal_handler)
+        # signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     def stop(self):
         with shared.printLock:
@@ -246,7 +298,7 @@ class Main:
 
 if __name__ == "__main__":
     mainprogram = Main()
-    mainprogram.start()
+    mainprogram.start(shared.safeConfigGetBoolean('bitmessagesettings', 'daemon'))
 
 
 # So far, the creation of and management of the Bitmessage protocol and this
